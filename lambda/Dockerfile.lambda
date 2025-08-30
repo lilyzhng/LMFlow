@@ -1,0 +1,119 @@
+# Dockerfile.lambda - Optimized for Lambda GPU cluster with auto GitHub pull
+FROM nvidia/cuda:11.8-cudnn8-devel-ubuntu20.04
+
+ENV TZ=Etc/UTC
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Install system dependencies including SSH for GitHub
+RUN apt-get update --fix-missing && \
+    apt-get install -y \
+    fontconfig \
+    libopenmpi-dev \
+    git \
+    python3.9 \
+    python3.9-dev \
+    python3.9-venv \
+    python3-pip \
+    build-essential \
+    cmake \
+    curl \
+    wget \
+    openssh-client \
+    --fix-missing && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python3.9 -m venv /venv
+ENV PATH=/venv/bin:$PATH
+
+# Upgrade pip and install wheel
+RUN pip install --upgrade pip wheel setuptools
+
+# Install PyTorch with CUDA 11.8 support FIRST
+RUN pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+
+# Install MPI4PY
+RUN pip install mpi4py
+
+# Set working directory
+WORKDIR /workspace
+
+# Setup SSH for GitHub (if using SSH keys)
+RUN mkdir -p /root/.ssh && \
+    chmod 700 /root/.ssh && \
+    ssh-keyscan github.com >> /root/.ssh/known_hosts
+
+# Clone the specific LMFlow repository and branch
+ARG GITHUB_REPO=git@github.com:lilyzhng/LMFlow.git
+ARG BRANCH=data4elm-data-prep
+ARG USE_HTTPS=true
+
+# Clone using HTTPS by default (more reliable for automated builds)
+RUN if [ "$USE_HTTPS" = "true" ]; then \
+        git clone --depth 1 --branch ${BRANCH} https://github.com/lilyzhng/LMFlow.git LMFlow; \
+    else \
+        git clone --depth 1 --branch ${BRANCH} ${GITHUB_REPO} LMFlow; \
+    fi
+
+# Set working directory to LMFlow
+WORKDIR /workspace/LMFlow
+
+# Install requirements (excluding torch since we installed specific version)
+RUN grep -v "^torch" requirements.txt > requirements_filtered.txt && \
+    pip install -r requirements_filtered.txt
+
+# Install additional packages for better WandB integration and visualization
+RUN pip install \
+    matplotlib \
+    seaborn \
+    plotly \
+    tensorboard \
+    ipywidgets \
+    jupyter
+
+# Install the package in development mode
+RUN pip install -e .
+
+# Set environment variables for better performance on Lambda GPU cluster
+ENV TOKENIZERS_PARALLELISM=false
+ENV WANDB_CACHE_DIR=/tmp/wandb
+ENV HF_HOME=/tmp/transformers_cache
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+ENV WANDB_PROJECT=lmflow-lambda-training
+ENV WANDB_LOG_MODEL=checkpoint
+
+# Create necessary directories
+RUN mkdir -p /tmp/wandb /tmp/transformers_cache /workspace/LMFlow/output_models /workspace/LMFlow/log
+
+# Set proper permissions
+RUN chmod -R 755 /workspace/LMFlow/
+
+# Create a script to update code from GitHub
+RUN echo '#!/bin/bash\n\
+echo "Updating LMFlow from GitHub..."\n\
+cd /workspace/LMFlow\n\
+git fetch origin\n\
+git reset --hard origin/${BRANCH:-data4elm-data-prep}\n\
+pip install -e .\n\
+echo "Update complete! Current commit:"\n\
+git log --oneline -1\n\
+' > /usr/local/bin/update-lmflow && \
+chmod +x /usr/local/bin/update-lmflow
+
+# Create WandB initialization script
+RUN echo '#!/bin/bash\n\
+echo "Setting up WandB..."\n\
+if [ -z "$WANDB_API_KEY" ]; then\n\
+    echo "Warning: WANDB_API_KEY not set. Please run: export WANDB_API_KEY=your_key"\n\
+    echo "Or login with: wandb login"\n\
+else\n\
+    echo "WandB API key found, logging in..."\n\
+    wandb login $WANDB_API_KEY\n\
+fi\n\
+echo "WandB setup complete!"\n\
+' > /usr/local/bin/setup-wandb && \
+chmod +x /usr/local/bin/setup-wandb
+
+# Set default command
+CMD ["bash"]
